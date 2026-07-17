@@ -1,0 +1,22 @@
+# Environment variables - never commit these
+.env
+
+# Python virtual environment
+.venv/
+
+# Python cache files - auto-generated, not needed
+__pycache__/
+*.pyc
+
+# Mac system files - useless clutter
+.DS_Store
+
+# Google service account credentials - NEVER commit these
+*.json
+ergbio-pipeline-*.json
+
+# Test HPLC files with potentially real data
+CBP_Run_SB_*.xlsx
+
+# Office temp files
+~$*
