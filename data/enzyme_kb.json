@@ -1,0 +1,93 @@
+{
+  "_meta": {
+    "description": "ErgBio enzyme knowledge base. Update lot_number, supplier_notes, and observed_performance as new enzyme lots are used.",
+    "last_updated": "2026-07",
+    "maintainer": "Ares / Lab team"
+  },
+  "enzymes": [
+    {
+      "commercial_name": "Cellic CTec3",
+      "manufacturer": "Novozymes",
+      "type": "Cellulase cocktail (cellulase + hemicellulase + beta-glucosidase)",
+      "primary_substrates": ["cellulose", "hemicellulose", "xylan"],
+      "products": ["glucose", "xylose", "cellobiose"],
+      "optimal_temp_c": 50,
+      "optimal_ph": 5.0,
+      "ph_range": "4.5–5.5",
+      "temp_range_c": "45–55",
+      "typical_loading_mg_per_g_biomass": "5–20",
+      "activity_units": "FPU/mL (filter paper units)",
+      "inhibitors": ["glucose (product inhibition)", "ethanol >5% v/v", "acetic acid >5 g/L"],
+      "known_strengths": "High beta-glucosidase activity reduces cellobiose accumulation. Strong on switchgrass and corn stover.",
+      "known_limitations": "Performance drops significantly above 55°C. Sensitive to high acetic acid.",
+      "lot_numbers_used": [],
+      "ergbio_notes": "Primary enzyme for EH runs. Update lot_numbers_used as new lots are tested."
+    },
+    {
+      "commercial_name": "Cellic CTec2",
+      "manufacturer": "Novozymes",
+      "type": "Cellulase cocktail",
+      "primary_substrates": ["cellulose", "hemicellulose"],
+      "products": ["glucose", "xylose"],
+      "optimal_temp_c": 50,
+      "optimal_ph": 5.0,
+      "ph_range": "4.5–5.5",
+      "temp_range_c": "45–55",
+      "typical_loading_mg_per_g_biomass": "10–30",
+      "activity_units": "FPU/mL",
+      "inhibitors": ["glucose", "cellobiose", "ethanol >8% v/v"],
+      "known_strengths": "Well-characterized, extensive literature baseline. Good on pretreated corn stover.",
+      "known_limitations": "Lower beta-glucosidase activity vs CTec3 — cellobiose accumulation at low loadings.",
+      "lot_numbers_used": [],
+      "ergbio_notes": "Previous generation — useful for literature comparisons. Update if used at ErgBio."
+    },
+    {
+      "commercial_name": "Accellerase 1500",
+      "manufacturer": "DuPont (now IFF)",
+      "type": "Cellulase + beta-glucosidase complex",
+      "primary_substrates": ["cellulose", "hemicellulose"],
+      "products": ["glucose", "xylose"],
+      "optimal_temp_c": 50,
+      "optimal_ph": 4.8,
+      "ph_range": "4.0–5.5",
+      "temp_range_c": "40–55",
+      "typical_loading_mg_per_g_biomass": "5–25",
+      "activity_units": "CMC units/mL",
+      "inhibitors": ["glucose", "ethanol", "phenolic compounds"],
+      "known_strengths": "Good thermostability up to 55°C. Effective on hardwoods and switchgrass.",
+      "known_limitations": "Less documented for high-solids loading than CTec3.",
+      "lot_numbers_used": [],
+      "ergbio_notes": "Add if used at ErgBio."
+    }
+  ],
+  "biomass_types": {
+    "SB": {
+      "full_name": "Switchgrass (Panicum virgatum)",
+      "typical_glucan_pct": "30–36",
+      "typical_xylan_pct": "20–25",
+      "typical_lignin_pct": "18–22",
+      "notes": "Primary ErgBio feedstock. High xylan content — xylose conversion important for full sugar utilization."
+    },
+    "RS": {
+      "full_name": "Rice straw",
+      "typical_glucan_pct": "32–38",
+      "typical_xylan_pct": "18–22",
+      "typical_lignin_pct": "12–18",
+      "notes": "High silica content can affect enzyme accessibility."
+    },
+    "CS": {
+      "full_name": "Corn stover",
+      "typical_glucan_pct": "35–40",
+      "typical_xylan_pct": "20–25",
+      "typical_lignin_pct": "15–20",
+      "notes": "Most extensively studied lignocellulosic feedstock — strong literature baseline."
+    },
+    "ALB": {
+      "full_name": "Albizia",
+      "typical_glucan_pct": "38–44",
+      "typical_xylan_pct": "14–18",
+      "typical_lignin_pct": "22–28",
+      "notes": "Hardwood. Higher lignin may require more aggressive pretreatment."
+    }
+  }
+}

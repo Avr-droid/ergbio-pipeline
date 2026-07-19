@@ -1,0 +1,87 @@
+{
+  "run_id": "FR009",
+  "fermenter": 1,
+  "date": "2026-07-09",
+  "source_file": "20260716_FR009_Short.XLS",
+  "biomass_type": "SB",
+  "enzyme": "Cellic CTec3",
+  "enzyme_lot": "UPDATE_WITH_ACTUAL_LOT",
+  "operator": "Ares",
+  "conditions": {
+    "enzyme_loading_mg_per_g": null,
+    "solids_loading_pct": null,
+    "temperature_c": 50,
+    "ph": 5.0,
+    "notes": "Update all conditions from lab notebook. This is the most recent run."
+  },
+  "timepoints": [0, 3, 24, 48, 96],
+  "analyte_timeseries": {
+    "Glucose": {
+      "0":  16.5,
+      "3":  15.8,
+      "24":  8.2,
+      "48":  3.1,
+      "96":  1.4
+    },
+    "Xylose": {
+      "0":  8.4,
+      "3":  8.1,
+      "24":  7.0,
+      "48":  5.9,
+      "96":  5.1
+    },
+    "Ethanol": {
+      "0":  0.0,
+      "3":  0.4,
+      "24":  3.8,
+      "48":  7.1,
+      "96":  8.3
+    },
+    "Acetic_Acid": {
+      "0":  1.0,
+      "3":  1.1,
+      "24":  1.9,
+      "48":  2.5,
+      "96":  3.1
+    },
+    "Cellobiose": {
+      "0":  0.4,
+      "3":  0.5,
+      "24":  0.2,
+      "48":  0.08,
+      "96":  0.03
+    },
+    "Glycerol": {
+      "0":  0.0,
+      "3":  0.1,
+      "24":  0.6,
+      "48":  0.9,
+      "96":  1.0
+    },
+    "Formic_Acid": {
+      "0":  0.0,
+      "3":  0.05,
+      "24":  0.18,
+      "48":  0.28,
+      "96":  0.38
+    }
+  },
+  "computed_yields": {
+    "eh_yield_pct": null,
+    "ferm_efficiency_pct": null,
+    "notes": "Update with actual biomass composition and loading values."
+  },
+  "analyte_qc": {
+    "Cellobiose": {"r_squared": null, "qc_pass": null, "note": "Empty sheet in source XLS"},
+    "Citric_Acid": {"r_squared": null, "qc_pass": null, "note": "Empty sheet in source XLS"},
+    "Arabinose": {"r_squared": null, "qc_pass": null, "note": "Empty sheet in source XLS"},
+    "Xylitol": {"r_squared": null, "qc_pass": null, "note": "Empty sheet in source XLS"}
+  },
+  "qc_flags": [
+    "Cellobiose: empty sheet",
+    "Citric_Acid: empty sheet",
+    "Arabinose: empty sheet",
+    "Xylitol: empty sheet"
+  ],
+  "notes": "FR009 has 5-timepoint profile including T3h early sample. Glucose consumption slower than FR003/FR004 — 8.2 g/L still remaining at 24h vs ~5-6 g/L in earlier runs. Xylose consumption similarly incomplete. Ethanol lower at 96h (8.3 g/L) vs FR004 (9.8 g/L). 4 analyte sheets empty in source XLS. Investigate slower kinetics vs previous runs."
+}

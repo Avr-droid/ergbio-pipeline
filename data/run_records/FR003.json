@@ -1,0 +1,74 @@
+{
+  "run_id": "FR003",
+  "fermenter": 1,
+  "date": "2026-06-29",
+  "source_file": "20260629_FR003_FR004_vials_Short.XLS",
+  "biomass_type": "SB",
+  "enzyme": "Cellic CTec3",
+  "enzyme_lot": "UPDATE_WITH_ACTUAL_LOT",
+  "operator": "Ares",
+  "conditions": {
+    "enzyme_loading_mg_per_g": null,
+    "solids_loading_pct": null,
+    "temperature_c": 50,
+    "ph": 5.0,
+    "notes": "Processed alongside FR004 in same HPLC run. Update conditions from lab notebook."
+  },
+  "timepoints": [0, 24, 48, 96],
+  "analyte_timeseries": {
+    "Glucose": {
+      "0":  18.2,
+      "24":  6.4,
+      "48":  1.8,
+      "96":  0.9
+    },
+    "Xylose": {
+      "0":  9.1,
+      "24":  7.2,
+      "48":  5.8,
+      "96":  4.1
+    },
+    "Ethanol": {
+      "0":  0.0,
+      "24":  5.2,
+      "48":  8.6,
+      "96":  9.1
+    },
+    "Acetic_Acid": {
+      "0":  1.2,
+      "24":  2.1,
+      "48":  2.8,
+      "96":  3.4
+    },
+    "Cellobiose": {
+      "0":  0.3,
+      "24":  0.1,
+      "48":  0.05,
+      "96":  0.02
+    },
+    "Glycerol": {
+      "0":  0.0,
+      "24":  0.8,
+      "48":  1.1,
+      "96":  1.2
+    },
+    "Formic_Acid": {
+      "0":  0.0,
+      "24":  0.2,
+      "48":  0.3,
+      "96":  0.4
+    }
+  },
+  "computed_yields": {
+    "eh_yield_pct": null,
+    "ferm_efficiency_pct": null,
+    "notes": "Update once Ares confirms biomass composition and loadings for yield calculation."
+  },
+  "analyte_qc": {
+    "Formic_Acid": {"r_squared": 0.9647, "qc_pass": false, "note": "R² below 0.995 threshold — Formic_Acid values may be unreliable"}
+  },
+  "qc_flags": [
+    "Formic_Acid: R²=0.9647 below threshold 0.995"
+  ],
+  "notes": "FR003 processed in same HPLC file as FR004. Xylose consumption incomplete by 96h — organism did not fully consume pentose sugars. Acetic acid within normal range. Formic acid QC flag — interpret with caution."
+}
