@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SHARED_FOLDER_ID     = os.getenv("SHARED_FOLDER_ID")
+SHARED_DRIVE_ID      = os.getenv("SHARED_DRIVE_ID", "0AEwqgR6xKpf_Uk9PVA")
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 try:
@@ -407,7 +408,7 @@ def save_run(extracted_data: dict) -> dict:
         file_name = f"{safe_name}_{run['id']}.json"
         content   = json.dumps(run, indent=2).encode("utf-8")
         media     = MediaIoBaseUpload(io.BytesIO(content), mimetype="application/json")
-        file_meta = {"name": file_name, "parents": [SHARED_FOLDER_ID]}
+        file_meta = {"name": file_name, "parents": [SHARED_FOLDER_ID], "driveId": SHARED_DRIVE_ID}
         uploaded  = service.files().create(body=file_meta, media_body=media, fields="id", supportsAllDrives=True).execute()
         drive_file_id = uploaded.get("id")
     except Exception as e:

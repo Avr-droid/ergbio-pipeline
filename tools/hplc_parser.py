@@ -1,230 +1,438 @@
-import os
+"""
+hplc_parser.py — Shimadzu LabSolutions XLS parser for ErgBio fermentation data.
+
+File format (12 sheets, one per analyte):
+  Sheet names : Cellobiose, Citric_Acid, Glucose, Xylose, Arabinose,
+                Xylitol, Succinic_Acid, Glycerol, Formic_Acid,
+                Acetic_Acid, Ethanol, Component
+  Row 0       : title row (sheet/analyte name)
+  Row 1       : calibration metadata — contains R² and equation
+                e.g. ['Cellobiose','','Linear','Equal','Force',
+                       'Y = 3127.71*X   R^2 = 0.9996', ...]
+  Row 2       : blank
+  Row 3       : column headers
+                ['Filename','Sample Type','Sample Name','Integ. Type',
+                 'Area','ISTD Area','Area','Amount','Amount',
+                 '%Diff','%RSD-AMT','Peak Status']
+  Row 4+      : data rows (one row per injection)
+
+Sample types  : 'Std Bracket Sample', 'QC Sample',
+                'Blank Sample', 'Unknown Sample'
+
+Filename pattern for Unknown Samples (stored in col 0 of each row):
+  YYYYMMDD_RunID_FermN_Timepoint[_Replicate]
+  e.g. 20260709_FR009_1_24_1  →  FR009, fermenter=1, t=24h, rep=1
+
+Column indices (0-based):
+  0  Filename        7  Amount (primary concentration, g/L)
+  1  Sample Type     8  Amount (duplicate / ISTD-corrected)
+  2  Sample Name     9  %Diff
+  3  Integ. Type    10  %RSD-AMT
+  4  Area           11  Peak Status
+  5  ISTD Area
+  6  Area (ratio)
+
+QC thresholds (placeholder — update when Ares confirms):
+  R²     >= 0.995
+  %Diff  <= 15 %   (QC samples only)
+  CV     <= 10 %   (across replicates, computed in calculator)
+"""
+
 import re
-import csv
+import logging
 from pathlib import Path
+from typing import Optional
 
 try:
-    import openpyxl
-    HAS_OPENPYXL = True
+    import xlrd
+    HAS_XLRD = True
 except ImportError:
-    HAS_OPENPYXL = False
+    HAS_XLRD = False
 
-# §15.1: Extended timepoint regex — T0, T24h, T96+h, T96, 24h, 96+h
-TIMEPOINT_REGEX = re.compile(r'^T?\d+\+?h?$', re.IGNORECASE)
+logger = logging.getLogger(__name__)
 
-# §15.1: Row labels auto-flagged as controls (case-insensitive substring)
-CONTROL_LABELS = {"abiotic", "blank", "control", "novo only", "no cell", "media only"}
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+ANALYTE_SHEETS = [
+    "Cellobiose", "Citric_Acid", "Glucose", "Xylose", "Arabinose",
+    "Xylitol", "Succinic_Acid", "Glycerol", "Formic_Acid",
+    "Acetic_Acid", "Ethanol", "Component",
+]
+
+# Column indices within each data sheet
+COL_FILENAME    = 0
+COL_SAMPLE_TYPE = 1
+COL_SAMPLE_NAME = 2
+COL_AREA        = 4
+COL_AMOUNT      = 7   # primary concentration (g/L)
+COL_PCT_DIFF    = 9
+COL_PEAK_STATUS = 11
+
+SAMPLE_TYPE_UNKNOWN = "Unknown Sample"
+SAMPLE_TYPE_QC      = "QC Sample"
+SAMPLE_TYPE_STD     = "Std Bracket Sample"
+SAMPLE_TYPE_BLANK   = "Blank Sample"
+
+# QC thresholds — PLACEHOLDER, update once Ares confirms
+QC_R2_MIN      = 0.995
+QC_PCTDIFF_MAX = 15.0
+
+# Filename regex: YYYYMMDD_RUNID_FERM_TIMEPOINT[_REP]
+# Run IDs like FR009, FR003, etc.
+_FILENAME_RE = re.compile(
+    r'^(\d{8})_(FR\d+)_(\d+)_(\d+\+?)(?:_(\d+))?$',
+    re.IGNORECASE,
+)
+
+# R² extraction from calibration row
+_R2_RE = re.compile(r'R\^2\s*=\s*([\d.]+)', re.IGNORECASE)
+_EQ_RE = re.compile(r'(Y\s*=\s*[\d.]+\*X(?:\s*[+-]\s*[\d.]+)?)', re.IGNORECASE)
+
+# Values that mean "not detected / not applicable"
+_NULL_VALUES = {"nf", "n/a", "na", "none", "", "nd"}
 
 
-def _is_control(label: str) -> bool:
-    """Return True if this row should be auto-flagged as a control."""
-    low = label.strip().lower()
-    return any(kw in low for kw in CONTROL_LABELS)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _cell_str(sheet, row: int, col: int) -> str:
+    """Return string value of a cell, empty string if out of range."""
+    try:
+        val = sheet.cell_value(row, col)
+        return str(val).strip() if val is not None else ""
+    except IndexError:
+        return ""
 
 
-def _find_timepoint_header_row(rows):
-    """
-    Scan rows to find the one that contains timepoint column headers.
-    At least 2 cells must match TIMEPOINT_REGEX.
-    """
-    for i, row in enumerate(rows):
-        matches = sum(1 for cell in row if cell and TIMEPOINT_REGEX.match(str(cell).strip()))
-        if matches >= 2:
-            return i
+def _cell_float(sheet, row: int, col: int) -> Optional[float]:
+    """Return float value of a cell, None if missing/NF/blank."""
+    try:
+        val = sheet.cell_value(row, col)
+    except IndexError:
+        return None
+
+    if val is None:
+        return None
+    s = str(val).strip()
+    if s.lower() in _NULL_VALUES:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_r2(calib_row_values: list) -> Optional[float]:
+    """Extract R² from the calibration row (row index 1)."""
+    for cell in calib_row_values:
+        s = str(cell).strip()
+        m = _R2_RE.search(s)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
     return None
 
 
-def _extract_analyte_values(rows, header_idx, analyte_name):
+def _parse_equation(calib_row_values: list) -> Optional[str]:
+    """Extract calibration equation string from row index 1."""
+    for cell in calib_row_values:
+        s = str(cell).strip()
+        m = _EQ_RE.search(s)
+        if m:
+            return m.group(1).replace(" ", "")
+    return None
+
+
+def _parse_filename(fname: str) -> Optional[dict]:
     """
-    Find row(s) for a specific analyte and return {timepoint: value} dict.
-    If multiple rows match (e.g. mean + stdev), takes the first.
+    Parse a Shimadzu sample filename into structured metadata.
+
+    Returns dict with keys: run_id, fermenter, timepoint_h, replicate, date
+    Returns None if the filename doesn't match the expected pattern.
     """
-    header_row = rows[header_idx]
-    for row in rows[header_idx + 1:]:
-        if not row:
-            continue
-        label = str(row[0]).strip().lower() if row[0] else ""
-        if analyte_name.lower() in label:
-            values = {}
-            for j, cell in enumerate(header_row):
-                if cell and TIMEPOINT_REGEX.match(str(cell).strip()):
-                    raw = row[j] if j < len(row) else None
-                    try:
-                        values[str(cell).strip()] = float(raw) if raw not in (None, "", "None") else None
-                    except (ValueError, TypeError):
-                        values[str(cell).strip()] = None
-            return values
-    return {}
+    m = _FILENAME_RE.match(fname.strip())
+    if not m:
+        return None
 
-
-def _extract_condition_rows(rows, header_idx, existing_conditions=None):
-    """
-    §15.1: Extract per-condition rows from the HPLC sheet.
-
-    Each data row (below header) is treated as one condition.
-    Rows are matched to `existing_conditions` by name (case-insensitive).
-    Auto-flags control rows based on CONTROL_LABELS.
-
-    Returns list of dicts:
-        name, is_control, timepoints, t0_value, final_value, matched_condition
-    """
-    header_row = rows[header_idx]
-    timepoint_cols = [
-        (j, str(cell).strip())
-        for j, cell in enumerate(header_row)
-        if cell and TIMEPOINT_REGEX.match(str(cell).strip())
-    ]
-
-    # Build lookup for existing conditions (case-insensitive)
-    cond_lookup = {}
-    if existing_conditions:
-        for c in existing_conditions:
-            cond_lookup[c.get("name", "").strip().lower()] = c
-
-    results = []
-    for row in rows[header_idx + 1:]:
-        if not row or not any(str(c).strip() for c in row):
-            continue
-        label = str(row[0]).strip() if row[0] else ""
-        if not label:
-            continue
-
-        # Skip secondary stat rows (stdev, sem, cv%)
-        low = label.lower()
-        if any(kw in low for kw in ("stdev", "sd", "sem", "cv", "std dev", "%cv", "(g/l)", "(g/kg)")):
-            continue
-
-        ctrl = _is_control(label)
-        matched = cond_lookup.get(label.lower())
-
-        tp_values = {}
-        for j, tp_label in timepoint_cols:
-            raw = row[j] if j < len(row) else None
-            try:
-                tp_values[tp_label] = float(raw) if raw not in (None, "", "None") else None
-            except (ValueError, TypeError):
-                tp_values[tp_label] = None
-
-        tp_labels = [tp for _, tp in timepoint_cols]
-        t0     = tp_values.get(tp_labels[0])  if tp_labels else None
-        final  = tp_values.get(tp_labels[-1]) if tp_labels else None
-
-        results.append({
-            "name":               label,
-            "is_control":         ctrl,
-            "timepoints":         tp_values,
-            "t0_value":           t0,
-            "final_value":        final,
-            "matched_condition":  matched.get("name") if matched else None,
-        })
-
-    return results
-
-
-def _rows_from_xlsx(file_path):
-    """Load rows from an xlsx file, preferring a 'CBP' sheet."""
-    if not HAS_OPENPYXL:
-        return None, "openpyxl not installed — run: pip install openpyxl"
-    wb = openpyxl.load_workbook(file_path, data_only=True)
-    sheet = None
-    for name in wb.sheetnames:
-        if "cbp" in name.lower():
-            sheet = wb[name]
-            break
-    if sheet is None:
-        sheet = wb.active
-    rows = []
-    for row in sheet.iter_rows(values_only=True):
-        rows.append([str(cell) if cell is not None else "" for cell in row])
-    return rows, None
-
-
-def _rows_from_csv(file_path):
+    date_str, run_id, ferm, tp_str, rep_str = m.groups()
+    # Convert timepoint — strip trailing '+' if present, treat as int hours
+    tp_str_clean = tp_str.rstrip('+')
     try:
-        rows = []
-        with open(file_path, newline="", encoding="utf-8-sig") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                rows.append(row)
-        return rows, None
-    except FileNotFoundError:
-        return None, f"File not found: {file_path}"
-    except Exception as e:
-        return None, f"Could not read file: {e}" 
+        tp_h = int(tp_str_clean)
+    except ValueError:
+        tp_h = None
 
-
-def parse_hplc_file(file_path: str, existing_conditions=None) -> dict:
-    """
-    Parse an HPLC output file (.xlsx or .csv) for bioprocess data.
-
-    §15.1 compliance:
-    - Extended timepoint regex (T?\\d+\\+?h?)
-    - Auto-flags control rows by name substring
-    - Matches rows to existing_conditions (case-insensitive)
-
-    Returns:
-        success          bool
-        timepoints       list of timepoint labels
-        ethanol          dict {tp: g/L}
-        glucose          dict {tp: g/L}
-        xylose           dict {tp: g/L}
-        ethanol_t0       value at first tp
-        ethanol_final    value at last tp
-        glucose_final    value at last tp
-        xylose_final     value at last tp
-        t0_values        dict {condition_name: t0 ethanol value}  (for condition table auto-fill)
-        final_values     dict {condition_name: final ethanol value}
-        condition_rows   list of per-condition dicts (name, is_control, t0_value, final_value, matched_condition)
-        controls         list of control condition names auto-detected
-        error            (only if success=False)
-    """
-    ext = Path(file_path).suffix.lower()
-    if ext == ".xlsx":
-        rows, err = _rows_from_xlsx(file_path)
-    elif ext == ".csv":
-        rows, err = _rows_from_csv(file_path)
-    else:
-        return {"success": False, "error": f"Unsupported file type: {ext}"}
-
-    if err:
-        return {"success": False, "error": err}
-    if not rows:
-        return {"success": False, "error": "File appears to be empty"}
-
-    header_idx = _find_timepoint_header_row(rows)
-    if header_idx is None:
-        return {"success": False,
-                "error": "Could not find timepoint header row — expected ≥2 columns like T0, T24h, T96h"}
-
-    header_row = rows[header_idx]
-    timepoints = [str(cell).strip() for cell in header_row
-                  if cell and TIMEPOINT_REGEX.match(str(cell).strip())]
-
-    ethanol = _extract_analyte_values(rows, header_idx, "ethanol")
-    glucose = _extract_analyte_values(rows, header_idx, "glucose")
-    xylose  = _extract_analyte_values(rows, header_idx, "xylose")
-
-    # Per-condition rows (used for CBP condition table auto-fill)
-    cond_rows = _extract_condition_rows(rows, header_idx, existing_conditions)
-    t0_values    = {c["name"]: c["t0_value"]    for c in cond_rows}
-    final_values = {c["name"]: c["final_value"] for c in cond_rows}
-    controls     = [c["name"] for c in cond_rows if c["is_control"]]
-
-    first_tp = timepoints[0]  if timepoints else None
-    last_tp  = timepoints[-1] if timepoints else None
+    date_fmt = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
 
     return {
-        "success":         True,
-        "timepoints":      timepoints,
-        "ethanol":         ethanol,
-        "glucose":         glucose,
-        "xylose":          xylose,
-        "ethanol_t0":      ethanol.get(first_tp) if first_tp else None,
-        "ethanol_final":   ethanol.get(last_tp)  if last_tp  else None,
-        "glucose_final":   glucose.get(last_tp)  if last_tp  else None,
-        "xylose_final":    xylose.get(last_tp)   if last_tp  else None,
-        "t0_values":       t0_values,
-        "final_values":    final_values,
-        "condition_rows":  cond_rows,
-        "controls":        controls,
+        "run_id":      run_id.upper(),
+        "fermenter":   int(ferm),
+        "timepoint_h": tp_h,
+        "replicate":   int(rep_str) if rep_str else 1,
+        "date":        date_fmt,
+        "extended_tp": tp_str.endswith('+'),
     }
+
+
+# ---------------------------------------------------------------------------
+# Sheet parser
+# ---------------------------------------------------------------------------
+
+def _parse_sheet(sheet, analyte: str) -> dict:
+    """
+    Parse one analyte sheet.  Returns:
+        r_squared    : float or None
+        equation     : str or None
+        qc_pass      : bool or None (None = no calibration data)
+        rows         : list of row dicts (all sample types)
+        empty        : True if the sheet has no data rows
+        warnings     : list of warning strings
+    """
+    warnings = []
+
+    if sheet.nrows < 5:
+        return {"r_squared": None, "equation": None, "qc_pass": None,
+                "rows": [], "empty": True, "warnings": [f"{analyte}: sheet has fewer than 5 rows — skipped"]}
+
+    # --- Calibration row (index 1) ---
+    calib_vals = [sheet.cell_value(1, c) for c in range(sheet.ncols)]
+    r2       = _parse_r2(calib_vals)
+    equation = _parse_equation(calib_vals)
+
+    if r2 is None:
+        warnings.append(f"{analyte}: R² not found in calibration row")
+        qc_pass = None
+    else:
+        qc_pass = r2 >= QC_R2_MIN
+        if not qc_pass:
+            warnings.append(f"{analyte}: R²={r2:.4f} below threshold {QC_R2_MIN}")
+
+    # --- Data rows (index 4 onward) ---
+    rows = []
+    for row_idx in range(4, sheet.nrows):
+        sample_type = _cell_str(sheet, row_idx, COL_SAMPLE_TYPE)
+        filename    = _cell_str(sheet, row_idx, COL_FILENAME)
+
+        # Skip completely empty rows
+        if not sample_type and not filename:
+            continue
+
+        amount      = _cell_float(sheet, row_idx, COL_AMOUNT)
+        pct_diff    = _cell_float(sheet, row_idx, COL_PCT_DIFF)
+        peak_status = _cell_str(sheet, row_idx, COL_PEAK_STATUS)
+        sample_name = _cell_str(sheet, row_idx, COL_SAMPLE_NAME)
+
+        # QC sample %Diff check
+        if sample_type == SAMPLE_TYPE_QC and pct_diff is not None:
+            if abs(pct_diff) > QC_PCTDIFF_MAX:
+                warnings.append(
+                    f"{analyte}: QC '{filename}' %Diff={pct_diff:.1f}% exceeds {QC_PCTDIFF_MAX}%"
+                )
+
+        rows.append({
+            "filename":    filename,
+            "sample_type": sample_type,
+            "sample_name": sample_name,
+            "amount":      amount,
+            "pct_diff":    pct_diff,
+            "peak_status": peak_status,
+            "nf":          peak_status.upper() == "NF" or (amount is None and peak_status == ""),
+        })
+
+    empty = len(rows) == 0
+    if empty:
+        warnings.append(f"{analyte}: no data rows found — sheet may be empty")
+
+    return {
+        "r_squared": r2,
+        "equation":  equation,
+        "qc_pass":   qc_pass,
+        "rows":      rows,
+        "empty":     empty,
+        "warnings":  warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def parse_hplc_file(file_path: str) -> dict:
+    """
+    Parse a Shimadzu LabSolutions XLS file into structured fermentation data.
+
+    Returns a dict with:
+        success        bool
+        source_file    str
+        run_ids        list[str]  — distinct run IDs found (e.g. ['FR009'])
+        analyte_qc     dict       — per-analyte calibration info
+        samples        dict       — per-sample-filename data (Unknown Samples only)
+        all_rows       dict       — per-analyte, all row types (for debugging)
+        qc_flags       list[str]  — all QC warnings accumulated
+        error          str        — only present on failure
+    """
+    if not HAS_XLRD:
+        return {"success": False, "error": "xlrd is not installed — run: pip install xlrd"}
+
+    path = Path(file_path)
+    if not path.exists():
+        return {"success": False, "error": f"File not found: {file_path}"}
+    if path.suffix.upper() not in (".XLS",):
+        return {"success": False, "error": f"Expected .XLS file, got: {path.suffix}"}
+
+    try:
+        wb = xlrd.open_workbook(str(path))
+    except Exception as e:
+        return {"success": False, "error": f"Could not open workbook: {e}"}
+
+    sheet_names = wb.sheet_names()
+    analyte_qc = {}
+    all_rows   = {}
+    qc_flags   = []
+
+    # Accumulate per-sample, per-analyte data keyed by filename
+    # sample_data[filename][analyte] = {amount, pct_diff, peak_status, nf}
+    sample_data: dict = {}
+
+    for analyte in ANALYTE_SHEETS:
+        # Find sheet — name match is case-insensitive, ignoring spaces
+        sheet = None
+        for sname in sheet_names:
+            if sname.replace(" ", "_").lower() == analyte.lower():
+                sheet = wb.sheet_by_name(sname)
+                break
+        if sheet is None:
+            logger.warning("Sheet '%s' not found in %s", analyte, path.name)
+            analyte_qc[analyte] = {"r_squared": None, "equation": None,
+                                   "qc_pass": None, "empty": True}
+            qc_flags.append(f"{analyte}: sheet not found in workbook")
+            continue
+
+        result = _parse_sheet(sheet, analyte)
+        qc_flags.extend(result["warnings"])
+
+        analyte_qc[analyte] = {
+            "r_squared": result["r_squared"],
+            "equation":  result["equation"],
+            "qc_pass":   result["qc_pass"],
+            "empty":     result["empty"],
+        }
+        all_rows[analyte] = result["rows"]
+
+        # Index Unknown Sample rows by filename
+        for row in result["rows"]:
+            if row["sample_type"] != SAMPLE_TYPE_UNKNOWN:
+                continue
+            fname = row["filename"]
+            if fname not in sample_data:
+                sample_data[fname] = {}
+            sample_data[fname][analyte] = {
+                "amount":      row["amount"],
+                "pct_diff":    row["pct_diff"],
+                "peak_status": row["peak_status"],
+                "nf":          row["nf"],
+            }
+
+    # Build structured samples dict with parsed filename metadata
+    samples = {}
+    run_ids_seen = set()
+
+    for fname, analytes in sample_data.items():
+        meta = _parse_filename(fname)
+        if meta is None:
+            logger.warning("Could not parse filename: '%s' — included as-is", fname)
+            meta = {
+                "run_id":      "UNKNOWN",
+                "fermenter":   None,
+                "timepoint_h": None,
+                "replicate":   1,
+                "date":        None,
+                "extended_tp": False,
+            }
+        run_ids_seen.add(meta["run_id"])
+        samples[fname] = {
+            "filename":    fname,
+            "run_id":      meta["run_id"],
+            "fermenter":   meta["fermenter"],
+            "timepoint_h": meta["timepoint_h"],
+            "replicate":   meta["replicate"],
+            "date":        meta["date"],
+            "extended_tp": meta["extended_tp"],
+            "analytes":    analytes,
+        }
+
+    return {
+        "success":     True,
+        "source_file": path.name,
+        "run_ids":     sorted(run_ids_seen),
+        "analyte_qc":  analyte_qc,
+        "samples":     samples,
+        "all_rows":    all_rows,
+        "qc_flags":    qc_flags,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Convenience accessors (used by extractor.py and calculator)
+# ---------------------------------------------------------------------------
+
+def get_timeseries(parsed: dict, run_id: str, fermenter: int, analyte: str) -> dict:
+    """
+    Extract {timepoint_h: mean_amount} for a specific run/fermenter/analyte.
+
+    Averages across replicates at each timepoint.
+    Returns {} if nothing found.
+    """
+    if not parsed.get("success"):
+        return {}
+
+    from collections import defaultdict
+    tp_vals: dict = defaultdict(list)
+
+    for sample in parsed["samples"].values():
+        if sample["run_id"] != run_id or sample["fermenter"] != fermenter:
+            continue
+        tp = sample["timepoint_h"]
+        if tp is None:
+            continue
+        analyte_data = sample["analytes"].get(analyte, {})
+        amt = analyte_data.get("amount")
+        if amt is not None:
+            tp_vals[tp].append(amt)
+
+    # Mean across replicates
+    return {tp: sum(vals) / len(vals) for tp, vals in sorted(tp_vals.items())}
+
+
+def get_value_at(parsed: dict, run_id: str, fermenter: int,
+                 analyte: str, timepoint_h: int,
+                 replicate: int = None) -> Optional[float]:
+    """
+    Return the concentration of an analyte at a specific timepoint.
+
+    If replicate is None, returns the mean across all replicates.
+    Returns None if not found.
+    """
+    if not parsed.get("success"):
+        return None
+
+    vals = []
+    for sample in parsed["samples"].values():
+        if (sample["run_id"] != run_id
+                or sample["fermenter"] != fermenter
+                or sample["timepoint_h"] != timepoint_h):
+            continue
+        if replicate is not None and sample["replicate"] != replicate:
+            continue
+        amt = sample["analytes"].get(analyte, {}).get("amount")
+        if amt is not None:
+            vals.append(amt)
+
+    if not vals:
+        return None
+    return sum(vals) / len(vals)

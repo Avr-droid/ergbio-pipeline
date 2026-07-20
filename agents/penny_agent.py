@@ -1,17 +1,15 @@
 """
-penny_agent.py — ErgBio Research Assistant Agent for Penny and the science team.
+penny_agent.py — ErgBio Research Assistant Agent.
 
-Claude Sonnet with tool use. Loaded context at startup:
-  - All run records from data/run_records/
-  - Enzyme KB summary
-  - ErgBio process context
-
-Available tools:
-  search_papers     — Semantic Scholar / PubMed literature search
-  lookup_enzyme     — Local KB + UniProt enzyme information
-  get_biomass_info  — Biomass composition from local KB
-  compare_runs      — Side-by-side comparison of two or more runs
-  get_run_detail    — Full detail for a specific run ID
+Claude Sonnet with 8 tools:
+  search_papers          Semantic Scholar + PubMed literature search
+  lookup_enzyme          Local KB + UniProt enzyme information
+  get_biomass_info       Biomass composition from local KB
+  lookup_chemical        PubChem — inhibitor properties, molecular data
+  lookup_enzyme_kinetics BRENDA / ExPASy — Km, Vmax, substrate specificity
+  calculate_yields       Live EH yield + fermentation efficiency calculator
+  compare_runs           Side-by-side run comparison
+  get_run_detail         Full detail for a specific run
 """
 
 import os
@@ -23,9 +21,13 @@ from typing import Optional
 import anthropic
 from dotenv import load_dotenv
 
-from tools.literature_search import search_papers, format_for_context
-from tools.enzyme_lookup import (
-    lookup_enzyme, get_biomass_info, list_enzymes, format_enzyme_for_context
+from tools.literature_search import search_papers, format_for_context as fmt_papers
+from tools.enzyme_lookup     import lookup_enzyme, get_biomass_info, list_enzymes, format_enzyme_for_context
+from tools.pubchem_lookup    import get_fermentation_inhibitor_profile, format_for_context as fmt_pubchem
+from tools.brenda_lookup     import lookup_enzyme_kinetics, format_for_context as fmt_brenda
+from tools.calculator_tool   import (
+    calculate_eh_yield, calculate_fermentation_efficiency,
+    calculate_from_run_record, format_for_context as fmt_calc
 )
 
 load_dotenv()
@@ -34,8 +36,8 @@ logger = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 RUN_RECORDS_DIR = Path(__file__).parent.parent / "data" / "run_records"
-MODEL            = "claude-sonnet-4-6"
-MAX_TOKENS       = 4096
+MODEL           = "claude-sonnet-4-6"
+MAX_TOKENS      = 4096
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -44,38 +46,42 @@ MAX_TOKENS       = 4096
 SYSTEM_PROMPT = """You are the ErgBio Research Assistant — a scientific peer and reasoning partner for the ErgBio team, especially Penny (CEO) and the lab scientists.
 
 ErgBio is a biotech company focused on cellulosic ethanol production from lignocellulosic biomass (switchgrass, rice straw, corn stover, albizia). The process:
-  1. Pretreatment — breaks down the lignin structure to expose cellulose/hemicellulose
+  1. Pretreatment — breaks down lignin to expose cellulose/hemicellulose
   2. Enzymatic Hydrolysis (EH) — cellulase cocktails convert cellulose→glucose, hemicellulose→xylose
-  3. Fermentation — microorganisms (yeast or bacteria) convert sugars→ethanol
+  3. Fermentation — microorganisms convert sugars→ethanol
 
-KEY METRICS ErgBio tracks:
-  - EH Yield (%) = glucose released ÷ theoretical maximum from glucan content × 100
-  - Fermentation Efficiency (%) = ethanol produced ÷ theoretical maximum from sugars × 100
-  - Sugar consumption: did the organism consume all glucose AND xylose?
-  - Inhibitor accumulation: acetic acid, formic acid, furfural can stall fermentation
-  - Cellobiose: if elevated, indicates insufficient beta-glucosidase activity
+KEY METRICS:
+  EH Yield (%)          = glucose released ÷ theoretical max from glucan × 100
+  Fermentation Eff. (%) = ethanol produced ÷ theoretical max from sugars × 100
+  Xylose utilization    = xylose consumed ÷ initial xylose × 100
+  Target: EH yield >80%, ferm efficiency >90%, full xylose utilization
 
-HPLC analytes measured at each timepoint (g/L):
+HPLC ANALYTES (g/L at each timepoint):
   Cellobiose, Glucose, Xylose, Arabinose, Xylitol, Succinic_Acid,
   Glycerol, Formic_Acid, Acetic_Acid, Ethanol, Citric_Acid
 
-EXPERIMENTAL RUN RECORDS are loaded below. These are ErgBio's actual data. When reasoning about performance, always ground your analysis in the specific numbers from these records.
+INHIBITOR THRESHOLDS (watch for these in run data):
+  Acetic acid  >5 g/L  = inhibitory to most yeast
+  Formic acid  >1 g/L  = inhibitory
+  Ethanol      >40 g/L = inhibitory (ErgBio currently 8–10 g/L, well below)
 
-HOW TO BEHAVE:
-- Reason like a senior biochemical engineer / fermentation scientist
-- Be specific: cite actual numbers from run records, not vague generalities
-- When you search literature, tell the team which papers you found and why they're relevant
-- Flag potential problems proactively (e.g. acetic acid level approaching inhibition threshold)
-- Make concrete experimental suggestions with reasoning
-- Be honest about uncertainty and small sample size (currently only a few runs)
-- Don't hallucinate enzyme lot numbers or yield values — use only what's in the run records
-- When comparing to literature, note whether ErgBio's conditions match the paper's conditions
+TOOLS AVAILABLE — use them proactively:
+  search_papers          → benchmarks, mechanisms, optimal conditions from literature
+  lookup_enzyme          → ErgBio KB + UniProt for enzyme products (CTec3, etc.)
+  lookup_enzyme_kinetics → BRENDA/ExPASy for Km, Vmax, substrate kinetics
+  lookup_chemical        → PubChem for inhibitor properties and thresholds
+  calculate_yields       → compute EH yield and ferm efficiency from numbers
+  compare_runs           → side-by-side run comparison
+  get_run_detail         → full data for a specific run
 
-TOOL USE:
-- Use search_papers when the team asks about mechanisms, benchmarks, or optimal conditions that aren't in the run data
-- Use lookup_enzyme when discussing specific enzyme products
-- Use compare_runs when asked to compare experiments
-- Always cite your sources (run ID for data, paper title/DOI for literature)"""
+BEHAVIOR:
+  - Reason like a senior biochemical engineer
+  - Cite specific numbers from run records — never hallucinate values
+  - Use calculate_yields whenever Penny asks about yields — don't just estimate
+  - Use lookup_chemical when discussing acetic acid, formic acid, furfural, or any inhibitor
+  - Flag problems proactively (e.g. incomplete xylose consumption, rising acetic acid)
+  - Be honest about small sample size (currently 3 runs)
+  - When comparing to literature, note whether ErgBio's conditions match"""
 
 
 # ---------------------------------------------------------------------------
@@ -83,169 +89,143 @@ TOOL USE:
 # ---------------------------------------------------------------------------
 
 def load_run_records() -> dict:
-    """Load all run JSON files from data/run_records/. Returns {run_id: record}."""
     records = {}
     if not RUN_RECORDS_DIR.exists():
         RUN_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
         return records
-
     for fpath in sorted(RUN_RECORDS_DIR.glob("*.json")):
         try:
             with open(fpath) as f:
                 rec = json.load(f)
-            run_id = rec.get("run_id", fpath.stem)
-            records[run_id] = rec
+            records[rec.get("run_id", fpath.stem)] = rec
         except Exception as e:
-            logger.warning("Could not load run record %s: %s", fpath.name, e)
-
+            logger.warning("Could not load %s: %s", fpath.name, e)
     return records
 
 
 def _build_runs_context(records: dict) -> str:
-    """Serialize run records into a compact context string."""
     if not records:
-        return "No run records loaded yet. Records will appear here once runs are processed through the pipeline."
-
+        return "No run records loaded yet."
     lines = [f"=== ErgBio Run Records ({len(records)} runs) ===\n"]
     for run_id, rec in records.items():
-        lines.append(f"--- {run_id} (Fermenter {rec.get('fermenter', '?')}) ---")
-        lines.append(f"Date: {rec.get('date', 'Unknown')} | Biomass: {rec.get('biomass_type', 'Unknown')}")
-        lines.append(f"Enzyme: {rec.get('enzyme', 'Unknown')} | Operator: {rec.get('operator', 'Unknown')}")
-        if rec.get("conditions"):
-            lines.append(f"Conditions: {json.dumps(rec['conditions'])}")
-        lines.append(f"Timepoints (h): {rec.get('timepoints', [])}")
-
-        # Key analyte timeseries
+        lines.append(f"--- {run_id} (Fermenter {rec.get('fermenter','?')}) ---")
+        lines.append(f"Date: {rec.get('date','?')} | Biomass: {rec.get('biomass_type','?')} | Enzyme: {rec.get('enzyme','?')}")
+        tps = rec.get("timepoints", [])
+        lines.append(f"Timepoints (h): {tps}")
         ts = rec.get("analyte_timeseries", {})
         for analyte in ["Glucose", "Xylose", "Ethanol", "Acetic_Acid", "Cellobiose"]:
             if analyte in ts:
-                vals = {str(k): round(v, 2) if v is not None else None
-                        for k, v in ts[analyte].items()}
-                lines.append(f"  {analyte} (g/L): {vals}")
-
-        # Computed yields
-        if rec.get("computed_yields"):
-            lines.append(f"Computed yields: {json.dumps(rec['computed_yields'])}")
-
-        # QC flags
+                vals = {str(k): round(v, 2) if v is not None else None for k, v in ts[analyte].items()}
+                lines.append(f"  {analyte}: {vals}")
         if rec.get("qc_flags"):
-            lines.append(f"QC flags: {rec['qc_flags'][:3]}")  # first 3
-
+            lines.append(f"  QC flags: {rec['qc_flags'][:2]}")
         if rec.get("notes"):
-            lines.append(f"Notes: {rec['notes']}")
+            lines.append(f"  Notes: {rec['notes'][:200]}")
         lines.append("")
-
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Tool definitions (Claude tool use API format)
+# Tool definitions
 # ---------------------------------------------------------------------------
 
 TOOLS = [
     {
         "name": "search_papers",
-        "description": (
-            "Search scientific literature (Semantic Scholar + PubMed) for papers "
-            "relevant to a question about enzymatic hydrolysis, fermentation, enzyme "
-            "performance, inhibitor effects, or cellulosic ethanol production. "
-            "Use when you need benchmarks, mechanistic explanations, or optimal condition "
-            "ranges that aren't answered by ErgBio's own run data."
-        ),
+        "description": "Search Semantic Scholar and PubMed for scientific literature on enzymatic hydrolysis, fermentation, enzyme performance, inhibitor effects, or cellulosic ethanol. Use for benchmarks, mechanisms, and optimal conditions.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query. Be specific — e.g. 'acetic acid inhibition xylose fermentation Saccharomyces cerevisiae' rather than 'fermentation problems'."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Number of papers to return (2–8 recommended). Default 5.",
-                    "default": 5
-                },
-                "source": {
-                    "type": "string",
-                    "enum": ["semantic_scholar", "pubmed", "both"],
-                    "description": "Which database to search. Default: semantic_scholar.",
-                    "default": "semantic_scholar"
-                }
+                "query":  {"type": "string", "description": "Specific search query, e.g. 'acetic acid inhibition xylose fermentation Saccharomyces cerevisiae'"},
+                "limit":  {"type": "integer", "default": 5},
+                "source": {"type": "string", "enum": ["semantic_scholar", "pubmed", "both"], "default": "semantic_scholar"}
             },
             "required": ["query"]
         }
     },
     {
         "name": "lookup_enzyme",
-        "description": (
-            "Look up information about a specific enzyme product: optimal conditions, "
-            "substrates, inhibitors, known strengths/limitations, and ErgBio-specific notes. "
-            "Checks the ErgBio local KB first, then UniProt for protein-level detail."
-        ),
+        "description": "Look up a commercial enzyme product (e.g. Cellic CTec3). Returns optimal conditions, substrates, inhibitors, ErgBio notes from local KB plus UniProt data.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Enzyme commercial name (e.g. 'Cellic CTec3') or common name (e.g. 'cellulase', 'xylanase')."
-                },
-                "include_uniprot": {
-                    "type": "boolean",
-                    "description": "Whether to also fetch protein details from UniProt. Default true.",
-                    "default": True
-                }
+                "name": {"type": "string"},
+                "include_uniprot": {"type": "boolean", "default": True}
             },
             "required": ["name"]
         }
     },
     {
-        "name": "get_biomass_info",
-        "description": "Get biomass composition data (glucan%, xylan%, lignin%) for a feedstock type.",
+        "name": "lookup_enzyme_kinetics",
+        "description": "Look up enzyme kinetics from BRENDA/ExPASy — Km, Vmax, kcat, substrate specificity, inhibition constants. More detailed than lookup_enzyme for kinetic questions.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "biomass_code": {
-                    "type": "string",
-                    "description": "Biomass code: SB (switchgrass), RS (rice straw), CS (corn stover), ALB (albizia)."
-                }
+                "enzyme_name": {"type": "string", "description": "Enzyme name or EC number, e.g. 'cellulase', 'beta-glucosidase', '3.2.1.4'"}
+            },
+            "required": ["enzyme_name"]
+        }
+    },
+    {
+        "name": "lookup_chemical",
+        "description": "Look up a chemical compound in PubChem. Essential for inhibitor analysis — acetic acid, formic acid, furfural, HMF, ethanol. Returns molecular data, inhibition thresholds, and fermentation context.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "compound_name": {"type": "string", "description": "Chemical name, e.g. 'acetic acid', 'furfural', 'hydroxymethylfurfural'"}
+            },
+            "required": ["compound_name"]
+        }
+    },
+    {
+        "name": "calculate_yields",
+        "description": "Calculate EH yield and fermentation efficiency from numbers. Use whenever Penny asks about yields, efficiency, or wants to know how a run performed vs theoretical maximum. Can compute from a run_id directly or from manually provided values.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "Run ID to auto-compute from loaded records (e.g. 'FR009'). Leave blank to use manual inputs."},
+                "glucose_released_g_l":  {"type": "number"},
+                "glucan_content_pct":    {"type": "number", "description": "Glucan % in biomass (e.g. 33.5)"},
+                "solids_loading_g_l":    {"type": "number", "description": "Biomass loading g/L"},
+                "ethanol_final_g_l":     {"type": "number"},
+                "glucose_t0_g_l":        {"type": "number"},
+                "xylose_t0_g_l":         {"type": "number"},
+                "glucose_final_g_l":     {"type": "number", "default": 0},
+                "xylose_final_g_l":      {"type": "number", "default": 0},
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_biomass_info",
+        "description": "Get biomass composition data (glucan%, xylan%, lignin%) for SB, RS, CS, or ALB feedstocks.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "biomass_code": {"type": "string", "description": "SB, RS, CS, or ALB"}
             },
             "required": ["biomass_code"]
         }
     },
     {
         "name": "compare_runs",
-        "description": (
-            "Compare two or more ErgBio runs side by side. Returns a structured comparison "
-            "of key metrics: glucose yield, xylose consumption, ethanol production, "
-            "acetic acid levels, and computed yields across timepoints."
-        ),
+        "description": "Compare two or more ErgBio runs side by side across key analytes and timepoints.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "run_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of run IDs to compare (e.g. ['FR003', 'FR009'])."
-                },
-                "analytes": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Which analytes to include. Default: ['Glucose', 'Xylose', 'Ethanol', 'Acetic_Acid'].",
-                    "default": ["Glucose", "Xylose", "Ethanol", "Acetic_Acid"]
-                }
+                "run_ids": {"type": "array", "items": {"type": "string"}},
+                "analytes": {"type": "array", "items": {"type": "string"}, "default": ["Glucose", "Xylose", "Ethanol", "Acetic_Acid"]}
             },
             "required": ["run_ids"]
         }
     },
     {
         "name": "get_run_detail",
-        "description": "Get the full detail record for a specific run ID.",
+        "description": "Get full detail record for a specific run ID.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "run_id": {
-                    "type": "string",
-                    "description": "Run ID, e.g. 'FR009'."
-                }
+                "run_id": {"type": "string"}
             },
             "required": ["run_id"]
         }
@@ -258,152 +238,108 @@ TOOLS = [
 # ---------------------------------------------------------------------------
 
 def _execute_tool(name: str, inputs: dict, records: dict) -> str:
-    """Dispatch a tool call and return the result as a string."""
     try:
         if name == "search_papers":
-            result = search_papers(
-                query=inputs["query"],
-                limit=inputs.get("limit", 5),
-                source=inputs.get("source", "semantic_scholar")
-            )
-            return format_for_context(result)
+            return fmt_papers(search_papers(inputs["query"], inputs.get("limit", 5), inputs.get("source", "semantic_scholar")))
 
         elif name == "lookup_enzyme":
-            result = lookup_enzyme(
-                name=inputs["name"],
-                include_uniprot=inputs.get("include_uniprot", True)
-            )
-            return format_enzyme_for_context(result)
+            return format_enzyme_for_context(lookup_enzyme(inputs["name"], inputs.get("include_uniprot", True)))
+
+        elif name == "lookup_enzyme_kinetics":
+            return fmt_brenda(lookup_enzyme_kinetics(inputs["enzyme_name"]))
+
+        elif name == "lookup_chemical":
+            return fmt_pubchem(get_fermentation_inhibitor_profile(inputs["compound_name"]))
+
+        elif name == "calculate_yields":
+            run_id = inputs.get("run_id")
+            if run_id and run_id in records:
+                return fmt_calc(calculate_from_run_record(records[run_id]))
+            elif run_id:
+                return f"Run '{run_id}' not found. Available: {list(records.keys())}"
+            # Manual inputs
+            results = {}
+            if all(k in inputs for k in ["glucose_released_g_l", "glucan_content_pct", "solids_loading_g_l"]):
+                results["eh_yield"] = calculate_eh_yield(
+                    inputs["glucose_released_g_l"], inputs["glucan_content_pct"], inputs["solids_loading_g_l"]
+                )
+            if all(k in inputs for k in ["ethanol_final_g_l", "glucose_t0_g_l", "xylose_t0_g_l"]):
+                results["ferm_efficiency"] = calculate_fermentation_efficiency(
+                    inputs["ethanol_final_g_l"], inputs["glucose_t0_g_l"], inputs["xylose_t0_g_l"],
+                    inputs.get("glucose_final_g_l", 0), inputs.get("xylose_final_g_l", 0)
+                )
+            if not results:
+                return "Provide either a run_id or manual values (glucose_released_g_l, glucan_content_pct, etc.)"
+            results["success"] = True
+            return fmt_calc(results)
 
         elif name == "get_biomass_info":
             result = get_biomass_info(inputs["biomass_code"])
-            if result.get("success"):
-                return json.dumps(result, indent=2)
-            return result.get("error", "Not found")
+            return json.dumps(result, indent=2) if result.get("success") else result.get("error", "Not found")
 
         elif name == "compare_runs":
             run_ids  = inputs["run_ids"]
             analytes = inputs.get("analytes", ["Glucose", "Xylose", "Ethanol", "Acetic_Acid"])
-            comparison = {"runs_compared": run_ids, "analytes": {}}
+            out = {"runs": run_ids, "analytes": {}, "computed_yields": {}}
             for analyte in analytes:
-                comparison["analytes"][analyte] = {}
+                out["analytes"][analyte] = {}
                 for rid in run_ids:
                     rec = records.get(rid)
-                    if not rec:
-                        comparison["analytes"][analyte][rid] = "RUN NOT FOUND"
-                        continue
-                    ts = rec.get("analyte_timeseries", {}).get(analyte, {})
-                    comparison["analytes"][analyte][rid] = {
-                        str(k): round(v, 2) if v is not None else None
-                        for k, v in ts.items()
-                    }
-            # Also compare computed yields
-            comparison["computed_yields"] = {}
+                    ts  = rec.get("analyte_timeseries", {}).get(analyte, {}) if rec else {}
+                    out["analytes"][analyte][rid] = {str(k): round(v,2) if v else None for k,v in ts.items()} if ts else "NOT FOUND"
             for rid in run_ids:
                 rec = records.get(rid)
-                comparison["computed_yields"][rid] = rec.get("computed_yields", {}) if rec else "NOT FOUND"
-            return json.dumps(comparison, indent=2)
+                out["computed_yields"][rid] = rec.get("computed_yields", {}) if rec else "NOT FOUND"
+            return json.dumps(out, indent=2)
 
         elif name == "get_run_detail":
-            run_id = inputs["run_id"]
-            rec = records.get(run_id)
-            if not rec:
-                available = list(records.keys())
-                return f"Run '{run_id}' not found. Available runs: {available}"
-            return json.dumps(rec, indent=2)
+            rid = inputs["run_id"]
+            rec = records.get(rid)
+            return json.dumps(rec, indent=2) if rec else f"Run '{rid}' not found. Available: {list(records.keys())}"
 
-        else:
-            return f"Unknown tool: {name}"
+        return f"Unknown tool: {name}"
 
     except Exception as e:
-        logger.error("Tool '%s' failed: %s", name, e)
-        return f"Tool error ({name}): {str(e)}"
+        logger.error("Tool '%s' error: %s", name, e)
+        return f"Tool error ({name}): {e}"
 
 
 # ---------------------------------------------------------------------------
-# Main agent function
+# Main chat function
 # ---------------------------------------------------------------------------
 
-def chat(
-    user_message: str,
-    history: list[dict],
-    records: Optional[dict] = None,
-    on_tool_call: Optional[callable] = None,
-) -> tuple[str, list[dict]]:
-    """
-    Send a message to the Penny Agent and get a response.
-
-    Args:
-        user_message : The scientist's question or message.
-        history      : Conversation history (list of {role, content} dicts).
-                       Pass [] for a new conversation.
-        records      : Run records dict. If None, loads from disk.
-        on_tool_call : Optional callback(tool_name, inputs) called when a tool fires.
-                       Use this in the Streamlit UI to show live tool status.
-
-    Returns:
-        (response_text, updated_history)
-    """
+def chat(user_message: str, history: list, records: Optional[dict] = None,
+         on_tool_call: Optional[callable] = None) -> tuple[str, list]:
     if records is None:
         records = load_run_records()
 
-    # Build system prompt with run context injected
-    runs_context = _build_runs_context(records)
-    system = f"{SYSTEM_PROMPT}\n\n{runs_context}"
-
-    # Append user message to history
+    system = f"{SYSTEM_PROMPT}\n\n{_build_runs_context(records)}"
     messages = history + [{"role": "user", "content": user_message}]
 
-    # Agentic loop — keep going until Claude stops calling tools
     while True:
         response = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=system,
-            tools=TOOLS,
-            messages=messages,
+            model=MODEL, max_tokens=MAX_TOKENS,
+            system=system, tools=TOOLS, messages=messages,
         )
-
-        # Append Claude's response to history
         messages.append({"role": "assistant", "content": response.content})
-
         if response.stop_reason != "tool_use":
             break
 
-        # Execute all tool calls in this response
         tool_results = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
-
             if on_tool_call:
                 on_tool_call(block.name, block.input)
-
             result = _execute_tool(block.name, block.input, records)
-            tool_results.append({
-                "type":        "tool_result",
-                "tool_use_id": block.id,
-                "content":     result,
-            })
-
+            tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
         messages.append({"role": "user", "content": tool_results})
 
-    # Extract final text response
-    text = next(
-        (block.text for block in response.content if hasattr(block, "text")),
-        ""
-    )
-
+    text = next((b.text for b in response.content if hasattr(b, "text")), "")
     return text, messages
 
 
 def get_run_summary(records: dict) -> str:
-    """One-line summary of loaded runs for sidebar display."""
     if not records:
         return "No runs loaded"
-    summaries = []
-    for rid, rec in records.items():
-        tp = rec.get("timepoints", [])
-        biomass = rec.get("biomass_type", "?")
-        summaries.append(f"{rid} ({biomass}, {len(tp)} timepoints)")
-    return " | ".join(summaries)
+    return " | ".join(f"{rid} ({rec.get('biomass_type','?')})" for rid, rec in records.items())
